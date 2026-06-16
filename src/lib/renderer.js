@@ -13,19 +13,19 @@ export class KilnRenderer {
       antialias: true,
       alpha: true,
       preserveDrawingBuffer: true,
+      powerPreference: 'high-performance',
     })
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
     this.renderer.shadowMap.enabled = true
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping
-    this.renderer.toneMappingExposure = 1.2
+    this.renderer.toneMappingExposure = 1.6
     this.renderer.outputColorSpace = THREE.SRGBColorSpace
 
     this.scene = new THREE.Scene()
-    this.camera = new THREE.PerspectiveCamera(45, 1, 0.01, 100)
+    this.camera = new THREE.PerspectiveCamera(40, 1, 0.01, 100)
     this.camera.position.set(0, 0, 6)
 
-    // Orbit controls
     this.controls = new OrbitControls(this.camera, canvas)
     this.controls.enableDamping = true
     this.controls.dampingFactor = 0.05
@@ -33,13 +33,13 @@ export class KilnRenderer {
     this.controls.minDistance = 2
     this.controls.maxDistance = 15
 
-    // PMREMGenerator for env maps
     this.pmrem = new THREE.PMREMGenerator(this.renderer)
     this.pmrem.compileEquirectangularShader()
     const roomEnv = new RoomEnvironment()
-    this.envMap = this.pmrem.fromScene(roomEnv, 0.04)
+    this.envMap = this.pmrem.fromScene(roomEnv, 0.0)
     roomEnv.dispose()
     this.scene.environment = this.envMap.texture
+    this.scene.environmentIntensity = 2.0
 
     this.group = null
     this.lights = []
@@ -47,9 +47,8 @@ export class KilnRenderer {
     this.t = 0
     this.motionFn = MOTIONS.Turntable
     this.lastSVGString = null
-    this.lastDepth = 0.3
-    this.lastBevel = 0.02
     this.isAnimating = false
+    this.currentMatConfig = null
   }
 
   resize(w, h) {
@@ -64,32 +63,33 @@ export class KilnRenderer {
     this.lights = []
 
     const key = new THREE.DirectionalLight(env.key, env.keyInt)
-    key.position.set(4, 6, 4)
+    key.position.set(5, 8, 5)
     key.castShadow = true
-    key.shadow.mapSize.width = 1024
-    key.shadow.mapSize.height = 1024
-    this.scene.add(key)
-    this.lights.push(key)
+    key.shadow.mapSize.width = 2048
+    key.shadow.mapSize.height = 2048
+    key.shadow.camera.near = 0.1
+    key.shadow.camera.far = 30
+    key.shadow.camera.left = -5; key.shadow.camera.right = 5
+    key.shadow.camera.top = 5; key.shadow.camera.bottom = -5
+    key.shadow.bias = -0.001
+    this.scene.add(key); this.lights.push(key)
 
     const amb = new THREE.AmbientLight(env.ambient, env.ambInt)
-    this.scene.add(amb)
-    this.lights.push(amb)
+    this.scene.add(amb); this.lights.push(amb)
 
     const rim = new THREE.DirectionalLight(env.rim, env.rimInt)
-    rim.position.set(-4, -2, -4)
-    this.scene.add(rim)
-    this.lights.push(rim)
+    rim.position.set(-5, -2, -5)
+    this.scene.add(rim); this.lights.push(rim)
 
-    const fill = new THREE.PointLight(env.ambient, env.ambInt * 0.5, 12)
-    fill.position.set(0, -4, 2)
-    this.scene.add(fill)
-    this.lights.push(fill)
+    const fill = new THREE.DirectionalLight(env.ambient, env.ambInt * 0.6)
+    fill.position.set(-3, 2, 4)
+    this.scene.add(fill); this.lights.push(fill)
 
-    // Subtle top bounce
-    const top = new THREE.DirectionalLight(env.key, env.keyInt * 0.15)
-    top.position.set(0, 8, 0)
-    this.scene.add(top)
-    this.lights.push(top)
+    const top = new THREE.DirectionalLight(env.key, env.keyInt * 0.1)
+    top.position.set(0, 10, 0)
+    this.scene.add(top); this.lights.push(top)
+
+    if (this.group && this.currentMatConfig) this.setMaterial(this.currentMatConfig)
   }
 
   _buildMaterial(matConfig) {
@@ -101,11 +101,13 @@ export class KilnRenderer {
       envMap: this.envMap.texture,
       transparent: matConfig.transparent || false,
       opacity: matConfig.opacity !== undefined ? matConfig.opacity : 1,
+      side: THREE.DoubleSide, // fixes hollow look
     })
   }
 
   setMaterial(matConfig) {
     if (!this.group) return
+    this.currentMatConfig = matConfig
     const mat = this._buildMaterial(matConfig)
     this.group.traverse(child => {
       if (child.isMesh) {
@@ -116,18 +118,13 @@ export class KilnRenderer {
     mat.dispose()
   }
 
-  loadSVG(svgString, depth = 0.3, bevel = 0.02, matConfig = null) {
+  loadSVG(svgString, depth = 0.3, bevel = 0.02) {
     this.lastSVGString = svgString
-    this.lastDepth = depth
-    this.lastBevel = bevel
 
     if (this.group) {
       this.scene.remove(this.group)
       this.group.traverse(child => {
-        if (child.isMesh) {
-          child.geometry.dispose()
-          child.material.dispose()
-        }
+        if (child.isMesh) { child.geometry.dispose(); child.material.dispose() }
       })
       this.group = null
     }
@@ -137,7 +134,6 @@ export class KilnRenderer {
       const data = loader.parse(svgString)
       const group = new THREE.Group()
 
-      // Compute bounding box of all paths for normalization
       let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
       data.paths.forEach(path => {
         const shapes = SVGLoader.createShapes(path)
@@ -148,8 +144,7 @@ export class KilnRenderer {
             minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y)
           })
           shape.holes.forEach(hole => {
-            const hpts = hole.getPoints(12)
-            hpts.forEach(p => {
+            hole.getPoints(12).forEach(p => {
               minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x)
               minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y)
             })
@@ -158,20 +153,14 @@ export class KilnRenderer {
       })
 
       if (!isFinite(minX)) { minX = 0; maxX = 100; minY = 0; maxY = 100 }
-      const rangeX = maxX - minX || 100
-      const rangeY = maxY - minY || 100
-      const scale = 3 / Math.max(rangeX, rangeY)
+      const scale = 3 / Math.max(maxX - minX || 100, maxY - minY || 100)
       const cx = (minX + maxX) / 2
       const cy = (minY + maxY) / 2
 
-      data.paths.forEach((path, idx) => {
+      data.paths.forEach(path => {
         const shapes = SVGLoader.createShapes(path)
         if (!shapes.length) return
-
-        // Per-path color from SVG fill
-        const fillColor = path.color || new THREE.Color('#888888')
-        const pathMatConfig = matConfig || { color: '#888888', metalness: 0.8, roughness: 0.2, envMapIntensity: 1.5 }
-
+        const matConfig = this.currentMatConfig || { color: '#888888', metalness: 0.8, roughness: 0.2, envMapIntensity: 1.5 }
         shapes.forEach(shape => {
           const geo = new THREE.ExtrudeGeometry(shape, {
             depth: depth * 100,
@@ -181,12 +170,9 @@ export class KilnRenderer {
             bevelSegments: 8,
             curveSegments: 16,
           })
-
           geo.scale(scale, -scale, scale)
           geo.translate(-cx * scale, cy * scale, 0)
-
-          const mat = this._buildMaterial(pathMatConfig)
-          const mesh = new THREE.Mesh(geo, mat)
+          const mesh = new THREE.Mesh(geo, this._buildMaterial(matConfig))
           mesh.castShadow = true
           mesh.receiveShadow = true
           group.add(mesh)
@@ -195,7 +181,6 @@ export class KilnRenderer {
 
       if (group.children.length === 0) return false
 
-      // Center group
       const box = new THREE.Box3().setFromObject(group)
       const center = box.getCenter(new THREE.Vector3())
       group.position.sub(center)
@@ -210,31 +195,34 @@ export class KilnRenderer {
   }
 
   setGeometry(depth, bevel) {
-    if (this.lastSVGString) {
-      this.loadSVG(this.lastSVGString, depth, bevel)
-    }
+    if (this.lastSVGString) this.loadSVG(this.lastSVGString, depth, bevel)
   }
 
   setMotion(motionName) {
     this.motionFn = MOTIONS[motionName] || MOTIONS.Turntable
   }
 
-  start(onFrame) {
+  // Seek to a specific normalised time [0..1] and render one frame -- for scrubber
+  seekAndRender(norm) {
+    if (!this.group) return
+    const t = norm * Math.PI * 2
+    this.group.rotation.set(0, 0, 0)
+    this.group.position.set(0, 0, 0)
+    this.group.scale.set(1, 1, 1)
+    this.motionFn(this.group, t)
+    this.controls.update()
+    this.renderer.render(this.scene, this.camera)
+  }
+
+  start() {
     if (this.animFrame) cancelAnimationFrame(this.animFrame)
     this.isAnimating = true
     const loop = () => {
       if (!this.isAnimating) return
       this.t += 0.016
-      if (this.group && this.motionFn) {
-        // Reset transform each frame before applying motion
-        if (this.group.position.y !== undefined && this.motionFn !== MOTIONS.Float) {
-          // keep position from motion
-        }
-        this.motionFn(this.group, this.t)
-      }
+      if (this.group && this.motionFn) this.motionFn(this.group, this.t)
       this.controls.update()
       this.renderer.render(this.scene, this.camera)
-      if (onFrame) onFrame()
       this.animFrame = requestAnimationFrame(loop)
     }
     this.animFrame = requestAnimationFrame(loop)
@@ -242,53 +230,60 @@ export class KilnRenderer {
 
   stop() {
     this.isAnimating = false
-    if (this.animFrame) {
-      cancelAnimationFrame(this.animFrame)
-      this.animFrame = null
-    }
+    if (this.animFrame) { cancelAnimationFrame(this.animFrame); this.animFrame = null }
   }
 
-  // Bake N frames into array of dataURLs (transparent PNG)
   async bakeFrames(frameCount, frameSize, onProgress) {
     this.stop()
 
+    // 2x internal resolution then downscale for quality
+    const SCALE = 2
     const offCanvas = document.createElement('canvas')
-    offCanvas.width = frameSize
-    offCanvas.height = frameSize
+    offCanvas.width = frameSize * SCALE
+    offCanvas.height = frameSize * SCALE
 
     const offRenderer = new THREE.WebGLRenderer({
       canvas: offCanvas,
       antialias: true,
       alpha: true,
       preserveDrawingBuffer: true,
+      powerPreference: 'high-performance',
     })
-    offRenderer.setSize(frameSize, frameSize)
+    offRenderer.setSize(frameSize * SCALE, frameSize * SCALE)
     offRenderer.setPixelRatio(1)
     offRenderer.toneMapping = THREE.ACESFilmicToneMapping
-    offRenderer.toneMappingExposure = 1.2
+    offRenderer.toneMappingExposure = 1.6
     offRenderer.outputColorSpace = THREE.SRGBColorSpace
 
     const offCamera = this.camera.clone()
     offCamera.aspect = 1
     offCamera.updateProjectionMatrix()
 
+    // Output canvas at target resolution
+    const outCanvas = document.createElement('canvas')
+    outCanvas.width = frameSize
+    outCanvas.height = frameSize
+    const outCtx = outCanvas.getContext('2d')
+
     const savedBg = this.scene.background
-    this.scene.background = null // transparent
+    this.scene.background = null
 
     const frames = []
 
     for (let i = 0; i < frameCount; i++) {
       const t = (i / frameCount) * Math.PI * 2
-
       if (this.group) {
         this.group.rotation.set(0, 0, 0)
         this.group.position.set(0, 0, 0)
         this.group.scale.set(1, 1, 1)
         this.motionFn(this.group, t)
       }
-
       offRenderer.render(this.scene, offCamera)
-      frames.push(offCanvas.toDataURL('image/png'))
+
+      // Downscale for crisp output
+      outCtx.clearRect(0, 0, frameSize, frameSize)
+      outCtx.drawImage(offCanvas, 0, 0, frameSize, frameSize)
+      frames.push(outCanvas.toDataURL('image/png'))
 
       if (onProgress) onProgress(Math.round(((i + 1) / frameCount) * 100))
       await new Promise(r => setTimeout(r, 8))
@@ -297,7 +292,6 @@ export class KilnRenderer {
     this.scene.background = savedBg
     offRenderer.dispose()
 
-    // Reset group transform
     if (this.group) {
       this.group.rotation.set(0, 0, 0)
       this.group.position.set(0, 0, 0)
@@ -309,61 +303,39 @@ export class KilnRenderer {
   }
 
   captureFrame(size = 256) {
+    const SCALE = 2
     const offCanvas = document.createElement('canvas')
-    offCanvas.width = size
-    offCanvas.height = size
-    const offRenderer = new THREE.WebGLRenderer({
-      canvas: offCanvas,
-      antialias: true,
-      alpha: true,
-      preserveDrawingBuffer: true,
-    })
-    offRenderer.setSize(size, size)
+    offCanvas.width = size * SCALE; offCanvas.height = size * SCALE
+    const offRenderer = new THREE.WebGLRenderer({ canvas: offCanvas, antialias: true, alpha: true, preserveDrawingBuffer: true })
+    offRenderer.setSize(size * SCALE, size * SCALE)
     offRenderer.setPixelRatio(1)
     offRenderer.toneMapping = THREE.ACESFilmicToneMapping
-    offRenderer.toneMappingExposure = 1.2
+    offRenderer.toneMappingExposure = 1.6
     offRenderer.outputColorSpace = THREE.SRGBColorSpace
 
     const offCamera = this.camera.clone()
-    offCamera.aspect = 1
-    offCamera.updateProjectionMatrix()
+    offCamera.aspect = 1; offCamera.updateProjectionMatrix()
 
     const savedBg = this.scene.background
     this.scene.background = new THREE.Color('#111111')
-
-    if (this.group) {
-      const saved = this.group.rotation.clone()
-      this.group.rotation.set(0.1, 0.6, 0)
-      offRenderer.render(this.scene, offCamera)
-      this.group.rotation.copy(saved)
-    } else {
-      offRenderer.render(this.scene, offCamera)
-    }
-
+    if (this.group) { const s = this.group.rotation.clone(); this.group.rotation.set(0.1, 0.6, 0); offRenderer.render(this.scene, offCamera); this.group.rotation.copy(s) }
+    else offRenderer.render(this.scene, offCamera)
     this.scene.background = savedBg
-    const data = offCanvas.toDataURL('image/png')
+
+    const outCanvas = document.createElement('canvas')
+    outCanvas.width = size; outCanvas.height = size
+    outCanvas.getContext('2d').drawImage(offCanvas, 0, 0, size, size)
+    const data = outCanvas.toDataURL('image/png')
     offRenderer.dispose()
     return data
   }
 
-  // Export current mesh as GLB binary
   exportGLB() {
     return new Promise((resolve, reject) => {
-      if (!this.group) { reject(new Error('No mesh to export')); return }
-      const exporter = new GLTFExporter()
-      exporter.parse(
-        this.group,
-        (result) => {
-          if (result instanceof ArrayBuffer) {
-            resolve(result)
-          } else {
-            const str = JSON.stringify(result)
-            resolve(new TextEncoder().encode(str).buffer)
-          }
-        },
-        (err) => reject(err),
-        { binary: true, embedImages: true }
-      )
+      if (!this.group) { reject(new Error('No mesh')); return }
+      new GLTFExporter().parse(this.group, result => {
+        resolve(result instanceof ArrayBuffer ? result : new TextEncoder().encode(JSON.stringify(result)).buffer)
+      }, reject, { binary: true, embedImages: true })
     })
   }
 
