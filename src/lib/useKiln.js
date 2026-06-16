@@ -1,11 +1,18 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
+import JSZip from 'jszip'
 import { ENVIRONMENTS, MATERIALS, MOTIONS } from './constants.js'
 import { KilnRenderer } from './renderer.js'
-import { exportFramePNG, exportFrameJPG, exportFrameWebP, exportStripPNG, exportStripJPG, exportStripWebP, exportGIF, exportMP4, exportFramesZIP, exportGLB, exportAll } from './export.js'
+import {
+  exportFramePNG, exportFrameJPG, exportFrameWebP,
+  exportStripPNG, exportStripJPG, exportStripWebP,
+  exportGIF, exportMP4, exportFramesZIP, exportGLB, exportAll,
+  buildSpriteSheet,
+} from './export.js'
+import { fetchLibrary, saveGeneration, deleteGeneration, loadFramesFromStorage } from './supabase.js'
 
 const DEFAULT_ENV = ENVIRONMENTS.Natural[0]
 
-export function useKiln(canvasRef, containerRef) {
+export function useKiln(canvasRef, containerRef, userHash) {
   const rendererRef = useRef(null)
 
   const [svgString, setSvgString] = useState(null)
@@ -20,25 +27,33 @@ export function useKiln(canvasRef, containerRef) {
   const [frameSize, setFrameSize] = useState(256)
   const [environment, setEnvironment] = useState(DEFAULT_ENV)
 
+  // frames: array of dataURL strings for current generation
   const [frames, setFrames] = useState([])
   const [scrubIndex, setScrubIndex] = useState(0)
+  const [isScrubbing, setIsScrubbing] = useState(false)
+
   const [baking, setBaking] = useState(false)
   const [bakeProgress, setBakeProgress] = useState(0)
   const [exporting, setExporting] = useState(false)
   const [exportStatus, setExportStatus] = useState(null)
   const [status, setStatus] = useState('Upload an SVG to begin')
+  const [syncing, setSyncing] = useState(false)
 
-  const [library, setLibrary] = useState(() => {
-    try { const s = localStorage.getItem('kiln_library'); return s ? JSON.parse(s) : [] } catch { return [] }
-  })
+  // Library comes from Supabase, metadata only (no frame data)
+  const [library, setLibrary] = useState([])
   const [activeId, setActiveId] = useState(null)
 
+  // Fetch library on mount / userHash change
   useEffect(() => {
-    try { localStorage.setItem('kiln_library', JSON.stringify(library)) } catch {
-      if (library.length > 1) setLibrary(prev => prev.slice(0, prev.length - 1))
-    }
-  }, [library])
+    if (!userHash) return
+    setSyncing(true)
+    fetchLibrary(userHash)
+      .then(data => setLibrary(data || []))
+      .catch(e => setStatus(`Sync error: ${e.message}`))
+      .finally(() => setSyncing(false))
+  }, [userHash])
 
+  // Init renderer
   useEffect(() => {
     if (!canvasRef.current) return
     const r = new KilnRenderer(canvasRef.current)
@@ -60,7 +75,7 @@ export function useKiln(canvasRef, containerRef) {
   useEffect(() => { rendererRef.current?.setMotion(motion) }, [motion])
 
   const loadSVG = useCallback((str, name) => {
-    setSvgString(str); setSvgName(name); setFrames([]); setScrubIndex(0)
+    setSvgString(str); setSvgName(name); setFrames([]); setScrubIndex(0); setIsScrubbing(false)
     if (rendererRef.current) {
       const ok = rendererRef.current.loadSVG(str, depth, bevel)
       if (ok) {
@@ -85,65 +100,137 @@ export function useKiln(canvasRef, containerRef) {
     }
   }, [svgString, depth, bevel, material])
 
-  // Scrubber -- seek renderer to specific normalised time
+  // Scrubber: stop live animation, seek renderer to this frame's position
   const scrub = useCallback((index) => {
     if (!frames.length) return
-    setScrubIndex(index)
-    // Pause live animation and seek
     const r = rendererRef.current
     if (!r) return
-    r.stop()
-    // Draw the specific baked frame on a temp canvas, then let the main canvas show it
-    // Actually seek the live renderer to same position
+    if (!isScrubbing) {
+      r.stop()
+      setIsScrubbing(true)
+    }
+    setScrubIndex(index)
     const norm = index / Math.max(frames.length - 1, 1)
     r.seekAndRender(norm)
-  }, [frames.length])
+  }, [frames.length, isScrubbing])
 
   const resumePlayback = useCallback(() => {
     rendererRef.current?.start()
+    setIsScrubbing(false)
     setScrubIndex(0)
   }, [])
 
   const bake = useCallback(async () => {
     if (!rendererRef.current || !svgLoaded) return
     setBaking(true); setBakeProgress(0); setStatus('Baking...')
-    const f = await rendererRef.current.bakeFrames(frameCount, frameSize, p => { setBakeProgress(p); setStatus(`Baking ${p}%`) })
-    setFrames(f); setScrubIndex(0)
-    const thumb = rendererRef.current.captureFrame(128)
-    const entry = { id: Date.now(), name: svgName || 'untitled', thumb, frames: f, material, motion, environment: environment.id, depth, bevel, frameCount, frameSize, svgString }
-    setLibrary(prev => [entry, ...prev.slice(0, 49)])
-    setActiveId(entry.id)
-    setBaking(false); setStatus(`${frameCount} frames · ${frameSize}px`)
-  }, [svgLoaded, frameCount, frameSize, svgName, material, motion, environment, depth, bevel, svgString])
+    setIsScrubbing(false)
 
-  const loadLibraryItem = useCallback((item) => {
-    setActiveId(item.id); setFrames(item.frames); setScrubIndex(0)
+    const f = await rendererRef.current.bakeFrames(frameCount, frameSize, p => {
+      setBakeProgress(p); setStatus(`Baking ${p}%`)
+    })
+    setFrames(f); setScrubIndex(0)
+
+    const thumb = rendererRef.current.captureFrame(128)
+    const id = Date.now()
+
+    const entry = {
+      id, name: svgName || 'untitled', thumb,
+      frames: f, material, motion,
+      environment: environment.id,
+      depth, bevel, frameCount, frameSize, svgString,
+    }
+
+    // Build ZIP of frames for Supabase storage
+    if (userHash) {
+      setStatus('Uploading to library...')
+      try {
+        const zip = new JSZip()
+        const folder = zip.folder('frames')
+        f.forEach((src, i) => {
+          folder.file(`frame_${String(i).padStart(3, '0')}.png`, src.split(',')[1], { base64: true })
+        })
+        const zipBlob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 4 } })
+        await saveGeneration(userHash, entry, zipBlob)
+        // Refresh library from Supabase
+        const updated = await fetchLibrary(userHash)
+        setLibrary(updated || [])
+      } catch (e) {
+        setStatus(`Saved locally (sync failed: ${e.message})`)
+      }
+    }
+
+    setActiveId(id)
+    setBaking(false)
+    setStatus(`${frameCount} frames · ${frameSize}px`)
+  }, [svgLoaded, frameCount, frameSize, svgName, material, motion, environment, depth, bevel, svgString, userHash])
+
+  const loadLibraryItem = useCallback(async (item) => {
+    setActiveId(item.id)
     setMaterial(item.material); setMotion(item.motion)
     setDepth(item.depth); setBevel(item.bevel)
-    setFrameCount(item.frameCount); setFrameSize(item.frameSize)
+    setFrameCount(item.frame_count || item.frameCount)
+    setFrameSize(item.frame_size || item.frameSize)
+    setScrubIndex(0); setIsScrubbing(false)
+
+    // Resolve environment
     let env = DEFAULT_ENV
-    Object.values(ENVIRONMENTS).flat().forEach(e => { if (e.id === item.environment) env = e })
+    const envId = item.environment_id || item.environment
+    Object.values(ENVIRONMENTS).flat().forEach(e => { if (e.id === envId) env = e })
     setEnvironment(env)
-    if (item.svgString && rendererRef.current) {
-      setSvgString(item.svgString); setSvgName(item.name)
-      rendererRef.current.loadSVG(item.svgString, item.depth, item.bevel)
+
+    // Load frames from Supabase storage ZIP
+    const fCount = item.frame_count || item.frameCount
+    const fSize = item.frame_size || item.frameSize
+    const svgStr = item.svg_string || item.svgString
+    const name = item.name
+
+    if (item.zip_path && userHash) {
+      setStatus('Loading frames...')
+      try {
+        const loadedFrames = await loadFramesFromStorage(item.zip_path, fCount, fSize)
+        setFrames(loadedFrames)
+      } catch (e) {
+        setStatus(`Failed to load frames: ${e.message}`)
+      }
+    }
+
+    if (svgStr && rendererRef.current) {
+      setSvgString(svgStr); setSvgName(name)
+      rendererRef.current.loadSVG(svgStr, item.depth, item.bevel)
       rendererRef.current.setMaterial(MATERIALS[item.material])
       rendererRef.current.setMotion(item.motion)
       rendererRef.current.setEnvironment(env)
       setSvgLoaded(true)
     }
-    setStatus(`Loaded: ${item.name}`)
-  }, [])
+    setStatus(`Loaded: ${name}`)
+  }, [userHash])
 
-  const deleteLibraryItem = useCallback((id, e) => {
+  const deleteLibraryItem = useCallback(async (id, e) => {
     e.stopPropagation()
-    setLibrary(prev => prev.filter(i => i.id !== id))
-    if (activeId === id) setActiveId(null)
-  }, [activeId])
+    const item = library.find(i => i.id === id)
+    if (!item) return
+    try {
+      if (userHash && item.zip_path) {
+        await deleteGeneration(userHash, id, item.zip_path)
+      }
+      setLibrary(prev => prev.filter(i => i.id !== id))
+      if (activeId === id) { setActiveId(null); setFrames([]) }
+    } catch (e) {
+      setStatus(`Delete failed: ${e.message}`)
+    }
+  }, [library, activeId, userHash])
 
-  const clearLibrary = useCallback(() => {
-    setLibrary([]); setActiveId(null); localStorage.removeItem('kiln_library')
-  }, [])
+  const clearLibrary = useCallback(async () => {
+    if (!userHash) return
+    try {
+      await Promise.all(library.map(item =>
+        item.zip_path ? deleteGeneration(userHash, item.id, item.zip_path) : Promise.resolve()
+      ))
+      setLibrary([]); setActiveId(null); setFrames([])
+    } catch (e) {
+      setStatus(`Clear failed: ${e.message}`)
+    }
+  }, [library, userHash])
 
   const getGLB = async () => {
     if (!rendererRef.current || !svgLoaded) return null
@@ -152,19 +239,17 @@ export function useKiln(canvasRef, containerRef) {
 
   const doExport = useCallback(async (type) => {
     const name = svgName || 'kiln'
-    if (!frames.length && !['glb'].includes(type)) { setStatus('Bake first'); return }
+    if (!frames.length && type !== 'glb') { setStatus('Bake first'); return }
     setExporting(true)
     try {
+      const fi = Math.min(scrubIndex, frames.length - 1)
       switch (type) {
-        // Single frame exports (use scrubbed frame)
-        case 'png':  await exportFramePNG(frames[scrubIndex] || frames[0], name, scrubIndex); break
-        case 'jpg':  await exportFrameJPG(frames[scrubIndex] || frames[0], name, scrubIndex); break
-        case 'webp': await exportFrameWebP(frames[scrubIndex] || frames[0], name, scrubIndex); break
-        // Strip exports
-        case 'strip_png':  await exportStripPNG(frames, frameSize, name); break
-        case 'strip_jpg':  await exportStripJPG(frames, frameSize, name); break
-        case 'strip_webp': await exportStripWebP(frames, frameSize, name); break
-        // Video / animated
+        case 'png':       await exportFramePNG(frames[fi], name, fi); break
+        case 'jpg':       await exportFrameJPG(frames[fi], name, fi); break
+        case 'webp':      await exportFrameWebP(frames[fi], name, fi); break
+        case 'strip_png': await exportStripPNG(frames, frameSize, name); break
+        case 'strip_jpg': await exportStripJPG(frames, frameSize, name); break
+        case 'strip_webp':await exportStripWebP(frames, frameSize, name); break
         case 'gif':
           setExportStatus('Encoding GIF...')
           await exportGIF(frames, frameSize, name, p => setExportStatus(`GIF ${p}%`))
@@ -173,20 +258,27 @@ export function useKiln(canvasRef, containerRef) {
           setExportStatus('Encoding video...')
           await exportMP4(frames, frameSize, name, 24, p => setExportStatus(`Video ${p}%`))
           break
-        // 3D / bulk
         case 'frames': await exportFramesZIP(frames, name); break
-        case 'glb': { const buf = await getGLB(); if (buf) await exportGLB(buf, name); else setStatus('No mesh'); break }
-        case 'all': { const buf = await getGLB(); await exportAll(frames, frameSize, name, buf, msg => setExportStatus(msg)); break }
+        case 'glb': {
+          const buf = await getGLB()
+          if (buf) await exportGLB(buf, name); else setStatus('No mesh')
+          break
+        }
+        case 'all': {
+          const buf = await getGLB()
+          await exportAll(frames, frameSize, name, buf, msg => setExportStatus(msg))
+          break
+        }
       }
-      setStatus(`Exported: ${type.toUpperCase()}`)
+      setStatus(`Exported: ${type.toUpperCase().replace('_', ' ')}`)
     } catch (err) { setStatus(`Export failed: ${err.message}`) }
     setExporting(false); setExportStatus(null)
   }, [frames, scrubIndex, frameSize, svgName, svgLoaded])
 
   return {
     svgLoaded, svgName, material, motion, depth, bevel,
-    frameCount, frameSize, environment, frames, scrubIndex,
-    baking, bakeProgress, exporting, exportStatus, status,
+    frameCount, frameSize, environment, frames, scrubIndex, isScrubbing,
+    baking, bakeProgress, exporting, exportStatus, status, syncing,
     library, activeId,
     setMaterial, setMotion, setDepth, setBevel,
     setFrameCount, setFrameSize, setEnvironment,
