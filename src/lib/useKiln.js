@@ -187,7 +187,7 @@ export function useKiln(canvasRef, containerRef, userHash) {
     if (item.zip_path && userHash) {
       setStatus('Loading frames...')
       try {
-        const loadedFrames = await loadFramesFromStorage(item.zip_path, fCount, fSize)
+        const loadedFrames = await loadFramesFromStorage(item.zip_path, fCount)
         setFrames(loadedFrames)
       } catch (e) {
         setStatus(`Failed to load frames: ${e.message}`)
