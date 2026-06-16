@@ -1,5 +1,10 @@
 {
   "buildCommand": "rm -rf node_modules && npm install && ./node_modules/.bin/vite build",
   "outputDirectory": "dist",
-  "framework": "vite"
+  "framework": "vite",
+  "functions": {
+    "api/*.js": {
+      "runtime": "nodejs20.x"
+    }
+  }
 }
